@@ -245,14 +245,13 @@ refresh_port_list() {
   REAL_DEVICES=()
 
   local -a ports
-  # mapfile is the cleanest way (bash 4+)
   mapfile -t ports < <(find_serial_devices || true)
 
   local dev desc num=0
   for dev in "${ports[@]}"; do
     [[ -z "$dev" ]] && continue
     desc=$(describe_device "$dev" || true)
-    ((num++))
+    ((++num))
     DISPLAY_LINES+=("[$num] $dev   $desc")
     REAL_DEVICES+=("$dev")
   done
@@ -565,4 +564,6 @@ main() {
   interactive_wizard
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
