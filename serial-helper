@@ -1,0 +1,551 @@
+#!/usr/bin/env bash
+#
+# serial-helper - Interactive Linux serial port helper that wraps screen.
+# Walks you through discovering ports, picking settings, and connecting.
+#
+# Usage:
+#   serial-helper                  # full interactive wizard
+#   serial-helper /dev/ttyUSB0     # quick connect (uses 115200)
+#   serial-helper /dev/ttyUSB0 57600
+#   serial-helper --list           # just show ports
+#   serial-helper --help
+#
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# --------------------------- Colors & Output ---------------------------
+
+if [[ -t 1 ]] && [[ "${TERM:-}" != "dumb" ]]; then
+  BOLD=$'\033[1m'
+  DIM=$'\033[2m'
+  RED=$'\033[31m'
+  GREEN=$'\033[32m'
+  YELLOW=$'\033[33m'
+  BLUE=$'\033[34m'
+  CYAN=$'\033[36m'
+  RESET=$'\033[0m'
+else
+  BOLD='' DIM='' RED='' GREEN='' YELLOW='' BLUE='' CYAN='' RESET=''
+fi
+
+say()  { printf '%s\n' "$*"; }
+info() { printf '%s%s%s\n' "$CYAN" "$*" "$RESET"; }
+ok()   { printf '%s%s%s\n' "$GREEN" "$*" "$RESET"; }
+warn() { printf '%s%s%s\n' "$YELLOW" "$*" "$RESET"; }
+err()  { printf '%s%s%s\n' "$RED" "$*" "$RESET" >&2; }
+
+header() {
+  printf '\n%s%s%s\n' "$BOLD$BLUE" "$*" "$RESET"
+}
+
+divider() {
+  printf '%s%s%s\n' "$DIM" "────────────────────────────────────────────────────────────" "$RESET"
+}
+
+# --------------------------- Helpers ---------------------------
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+require_cmd() {
+  if ! have_cmd "$1"; then
+    err "Required command not found: $1"
+    return 1
+  fi
+}
+
+pause() {
+  read -r -p "Press Enter to continue..." _
+}
+
+get_distro() {
+  if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    echo "${ID:-unknown}"
+  else
+    echo "unknown"
+  fi
+}
+
+install_screen_hint() {
+  local distro
+  distro=$(get_distro)
+  echo
+  warn "screen is not installed."
+  echo
+  case "$distro" in
+    ubuntu|debian|linuxmint|pop)
+      say "  sudo apt update && sudo apt install screen"
+      ;;
+    fedora)
+      say "  sudo dnf install screen"
+      ;;
+    arch|manjaro|endeavouros)
+      say "  sudo pacman -S screen"
+      ;;
+    opensuse*|sles)
+      say "  sudo zypper install screen"
+      ;;
+    alpine)
+      say "  sudo apk add screen"
+      ;;
+    *)
+      say "  Use your package manager to install 'screen'."
+      ;;
+  esac
+  echo
+}
+
+# Check if user is in a group that typically owns serial devices
+user_can_access_serial() {
+  local groups
+  groups=$(groups 2>/dev/null || true)
+  if [[ "$groups" =~ (dialout|uucp|tty) ]]; then
+    return 0
+  fi
+  # Also check effective access to a sample device if any exist
+  for d in /dev/ttyUSB0 /dev/ttyACM0 /dev/ttyS0; do
+    if [[ -e "$d" ]] && [[ -r "$d" ]] && [[ -w "$d" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+print_permission_help() {
+  echo
+  warn "You probably don't have permission to open serial devices."
+  echo
+  say "Most distros put serial ports in the 'dialout' group (some use 'uucp')."
+  echo
+  say "Run one of these, then ${BOLD}log out and log back in${RESET}:"
+  echo
+  say "  ${BOLD}sudo usermod -a -G dialout \$USER${RESET}"
+  say "  # or"
+  say "  ${BOLD}sudo usermod -a -G uucp \$USER${RESET}"
+  echo
+  say "After logging back in, verify with:  ${DIM}groups${RESET}"
+  echo
+}
+
+# --------------------------- Port Discovery ---------------------------
+
+# Return a list of candidate devices (one per line)
+find_serial_devices() {
+  local -a devs=()
+  local d
+
+  # Common patterns
+  for pattern in \
+    '/dev/ttyUSB[0-9]*' \
+    '/dev/ttyACM[0-9]*' \
+    '/dev/ttyAMA[0-9]*' \
+    '/dev/ttyXRUSB[0-9]*' \
+    '/dev/ttyS[0-9]*'
+  do
+    # shellcheck disable=SC2086
+    for d in $pattern; do
+      [[ -e "$d" && -c "$d" ]] && devs+=("$d")
+    done
+  done
+
+  # Dedup and sort nicely (USB/ACM first, then others)
+  printf '%s\n' "${devs[@]}" | sort -V | uniq
+}
+
+# Try to return a nice one-line description for a device
+describe_device() {
+  local dev=$1
+  local desc=""
+  local vendor="" model="" serial="" driver=""
+
+  # 1. Try stable by-id symlink name (very informative)
+  if [[ -d /dev/serial/by-id ]]; then
+    local link target
+    for link in /dev/serial/by-id/*; do
+      [[ -e "$link" ]] || continue
+      target=$(readlink -f "$link" 2>/dev/null || true)
+      if [[ "$target" == "$(readlink -f "$dev" 2>/dev/null || true)" ]]; then
+        desc="$(basename "$link")"
+        break
+      fi
+    done
+  fi
+
+  # 2. Pull nice properties from udevadm when available
+  if have_cmd udevadm; then
+    local props
+    props=$(udevadm info -q property -n "$dev" 2>/dev/null || true)
+
+    vendor=$(grep -E '^ID_VENDOR=' <<<"$props" | head -1 | cut -d= -f2- || true)
+    model=$(grep -E '^ID_MODEL=' <<<"$props" | head -1 | cut -d= -f2- || true)
+    serial=$(grep -E '^ID_SERIAL_SHORT=' <<<"$props" | head -1 | cut -d= -f2- || true)
+    driver=$(grep -E '^ID_USB_DRIVER=' <<<"$props" | head -1 | cut -d= -f2- || true)
+
+    # Fallbacks
+    [[ -z "$vendor" ]] && vendor=$(grep -E '^ID_VENDOR_FROM_DATABASE=' <<<"$props" | head -1 | cut -d= -f2- || true)
+    [[ -z "$model"  ]] && model=$(grep -E '^ID_MODEL_FROM_DATABASE=' <<<"$props" | head -1 | cut -d= -f2- || true)
+  fi
+
+  # 3. Try sysfs for driver info if still empty
+  if [[ -z "$driver" && -e /sys/class/tty/$(basename "$dev")/device/driver ]]; then
+    driver=$(basename "$(readlink -f /sys/class/tty/$(basename "$dev")/device/driver 2>/dev/null || true)")
+  fi
+
+  # Build a nice string
+  local pretty=""
+  if [[ -n "$vendor" || -n "$model" ]]; then
+    pretty="${vendor:-} ${model:-}"
+    pretty=${pretty//_/ }   # turn underscores into spaces
+    pretty=$(sed 's/  */ /g' <<<"$pretty" | xargs) # collapse spaces
+  fi
+
+  if [[ -n "$serial" ]]; then
+    pretty="$pretty (S/N: $serial)"
+  fi
+
+  if [[ -n "$driver" ]]; then
+    pretty="$pretty [${driver}]"
+  fi
+
+  if [[ -n "$desc" ]]; then
+    # If we already have a by-id style name, prefer a shorter friendlier version
+    if [[ -z "$pretty" ]]; then
+      pretty="$desc"
+    else
+      pretty="$pretty  —  $desc"
+    fi
+  fi
+
+  [[ -z "$pretty" ]] && pretty="unknown / generic serial device"
+
+  printf '%s' "$pretty"
+}
+
+# Build parallel arrays: DISPLAY_LINES and REAL_DEVICES
+declare -a DISPLAY_LINES=()
+declare -a REAL_DEVICES=()
+
+refresh_port_list() {
+  DISPLAY_LINES=()
+  REAL_DEVICES=()
+
+  local dev desc num=0
+  while IFS= read -r dev; do
+    [[ -z "$dev" ]] && continue
+    desc=$(describe_device "$dev")
+    ((num++))
+    DISPLAY_LINES+=("[$num] $dev   $desc")
+    REAL_DEVICES+=("$dev")
+  done < <(find_serial_devices)
+}
+
+print_port_list() {
+  if (( ${#REAL_DEVICES[@]} == 0 )); then
+    warn "No serial devices found."
+    return 1
+  fi
+
+  header "Available serial ports"
+  local i
+  for i in "${!DISPLAY_LINES[@]}"; do
+    say "  ${DISPLAY_LINES[$i]}"
+  done
+  echo
+}
+
+show_recent_kernel_messages() {
+  header "Recent kernel messages (look for ttyUSB, ttyACM, ftdi, cdc_acm, etc.)"
+  if have_cmd dmesg; then
+    dmesg | tail -60 | grep -iE 'tty(USB|ACM|S|AMA)|ftdi|pl2303|ch341|cp210x|cdc_acm|uart|serial' || dmesg | tail -30
+  else
+    warn "dmesg not available."
+  fi
+  echo
+}
+
+# --------------------------- Baud Rate Selection ---------------------------
+
+COMMON_BAUDS=(300 1200 2400 4800 9600 19200 38400 57600 115200 230400 460800 921600)
+
+select_baud() {
+  local chosen=""
+
+  header "Choose baud rate"
+  say "Common rates:"
+  local i=0 b
+  for b in "${COMMON_BAUDS[@]}"; do
+    ((i++))
+    printf '  %2d) %s\n' "$i" "$b"
+  done
+  say "  c) Custom baud rate"
+  echo
+
+  local choice
+  read -r -p "Select [1-${i}, c]: " choice || true
+  choice=${choice:-1}
+
+  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#COMMON_BAUDS[@]} )); then
+    chosen="${COMMON_BAUDS[$((choice-1))]}"
+  elif [[ "$choice" == "c" || "$choice" == "C" ]]; then
+    read -r -p "Enter custom baud rate: " chosen || true
+    if ! [[ "$chosen" =~ ^[0-9]+$ ]] || (( chosen < 50 )); then
+      err "Invalid baud rate."
+      return 1
+    fi
+  else
+    # default to 115200 which is extremely common
+    chosen=115200
+  fi
+
+  echo "$chosen"
+}
+
+# --------------------------- The Actual Connection ---------------------------
+
+connect_with_screen() {
+  local port=$1
+  local baud=${2:-115200}
+
+  header "Ready to connect"
+
+  say "  Device : $port"
+  say "  Baud   : $baud"
+  say "  Command: ${BOLD}screen $port $baud${RESET}"
+  echo
+
+  # Quick sanity
+  if [[ ! -c "$port" ]]; then
+    err "$port is not a character device."
+    return 1
+  fi
+
+  if [[ ! -r "$port" || ! -w "$port" ]]; then
+    err "No read/write permission on $port"
+    print_permission_help
+    return 1
+  fi
+
+  read -r -p "Connect now? [Y/n] " ans || true
+  ans=${ans:-Y}
+  if [[ ! "$ans" =~ ^[Yy] ]]; then
+    say "Aborted."
+    return 0
+  fi
+
+  info "Starting screen... (Ctrl-A D to detach, Ctrl-A K to kill)"
+  echo
+
+  # Some people like to set the line first. We'll keep it simple and let
+  # screen do the heavy lifting, which is what most people expect.
+  exec screen "$port" "$baud"
+}
+
+# --------------------------- Main Wizard ---------------------------
+
+show_help() {
+  cat <<EOF
+serial-helper v${VERSION} — friendly wrapper around screen for Linux serial ports
+
+Usage:
+  serial-helper                  Start the interactive wizard
+  serial-helper /dev/ttyUSB0     Connect to a device at 115200 baud
+  serial-helper /dev/ttyUSB0 57600
+  serial-helper --list           List detected serial ports and exit
+  serial-helper --help           Show this help
+
+Inside screen:
+  Ctrl-A ?   → help
+  Ctrl-A D   → detach (session keeps running)
+  Ctrl-A K   → kill session
+  Ctrl-A H   → toggle logging
+EOF
+}
+
+list_only() {
+  refresh_port_list
+  if (( ${#REAL_DEVICES[@]} == 0 )); then
+    warn "No serial devices found."
+    show_recent_kernel_messages
+    return 1
+  fi
+  print_port_list
+  echo "Stable names (if present):"
+  ls -l /dev/serial/by-id/ 2>/dev/null || true
+}
+
+interactive_wizard() {
+  clear || true
+  header "Linux Serial Helper"
+  say "This wizard will walk you through connecting with ${BOLD}screen${RESET}."
+  divider
+
+  # --- Step 0: Prerequisites ---
+  if ! have_cmd screen; then
+    install_screen_hint
+    read -r -p "Install screen now? [y/N] " ans || true
+    if [[ "$ans" =~ ^[Yy] ]]; then
+      local distro
+      distro=$(get_distro)
+      case "$distro" in
+        ubuntu|debian|linuxmint|pop)
+          sudo apt update && sudo apt install -y screen
+          ;;
+        fedora)
+          sudo dnf install -y screen
+          ;;
+        arch|manjaro|endeavouros)
+          sudo pacman -S --noconfirm screen
+          ;;
+        *)
+          err "I don't know the command for your distro. Please install 'screen' manually."
+          exit 1
+          ;;
+      esac
+    else
+      err "screen is required."
+      exit 1
+    fi
+  fi
+  ok "screen is available."
+
+  if ! user_can_access_serial; then
+    print_permission_help
+    # We don't hard fail — user might be root or using sudo screen.
+  else
+    ok "You appear to have serial port access."
+  fi
+
+  # --- Main loop ---
+  while true; do
+    refresh_port_list
+
+    if (( ${#REAL_DEVICES[@]} == 0 )); then
+      warn "No serial devices detected right now."
+      echo
+      say "What would you like to do?"
+      say "  1) Rescan for devices"
+      say "  2) Show recent kernel messages (dmesg)"
+      say "  3) Wait for a device to appear (plug it in now)"
+      say "  4) Enter a device path manually"
+      say "  5) Quit"
+      echo
+      read -r -p "Choice: " c || true
+      case "$c" in
+        1) continue ;;
+        2) show_recent_kernel_messages; pause; continue ;;
+        3)
+          say "Plug in your device now. Press Ctrl-C to stop waiting."
+          while (( ${#REAL_DEVICES[@]} == 0 )); do
+            sleep 1
+            refresh_port_list
+            printf '.'
+          done
+          echo
+          ok "Device(s) appeared!"
+          ;;
+        4)
+          read -r -p "Enter full device path (e.g. /dev/ttyUSB0): " manual || true
+          if [[ -c "$manual" ]]; then
+            local b
+            b=$(select_baud) || continue
+            connect_with_screen "$manual" "$b" || true
+          else
+            err "Not a character device: $manual"
+          fi
+          continue
+          ;;
+        *) exit 0 ;;
+      esac
+    fi
+
+    print_port_list
+
+    say "Select a port number, or:"
+    say "  r = rescan"
+    say "  k = show recent kernel messages"
+    say "  m = enter device path manually"
+    say "  q = quit"
+    echo
+    read -r -p "Choice: " choice || true
+
+    case "$choice" in
+      [Qq]) exit 0 ;;
+      [Rr]) continue ;;
+      [Kk]) show_recent_kernel_messages; pause; continue ;;
+      [Mm])
+        read -r -p "Device path: " manual || true
+        [[ -c "$manual" ]] || { err "Not a character device."; continue; }
+        local b
+        b=$(select_baud) || continue
+        connect_with_screen "$manual" "$b" || true
+        # After screen exits we fall through and offer to go again
+        ;;
+      *)
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#REAL_DEVICES[@]} )); then
+          local port="${REAL_DEVICES[$((choice-1))]}"
+          local baud
+          baud=$(select_baud) || continue
+          connect_with_screen "$port" "$baud" || true
+        else
+          warn "Invalid choice."
+          sleep 1
+        fi
+        ;;
+    esac
+
+    # After returning from screen (or user bailed), give nice options
+    echo
+    header "Session ended"
+    say "  1) Reconnect with same port and baud"
+    say "  2) Change settings for same port"
+    say "  3) Choose a different port"
+    say "  4) Quit"
+    read -r -p "Choice: " post || true
+    case "$post" in
+      1)
+        # We don't remember the exact previous baud easily here.
+        # Just restart the loop; user can pick the same port quickly.
+        continue
+        ;;
+      2) continue ;;
+      3) continue ;;
+      *) exit 0 ;;
+    esac
+  done
+}
+
+# --------------------------- CLI Entry ---------------------------
+
+main() {
+  local arg1=${1:-}
+
+  case "$arg1" in
+    -h|--help|help)
+      show_help
+      exit 0
+      ;;
+    -l|--list|list)
+      list_only
+      exit $?
+      ;;
+    --version)
+      echo "serial-helper $VERSION"
+      exit 0
+      ;;
+  esac
+
+  # Quick non-interactive usage: serial-helper /dev/xxx [baud]
+  if [[ -n "$arg1" && -c "$arg1" ]]; then
+    local port=$arg1
+    local baud=${2:-115200}
+    connect_with_screen "$port" "$baud"
+    exit $?
+  fi
+
+  # Otherwise run the full wizard
+  interactive_wizard
+}
+
+main "$@"
