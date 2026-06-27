@@ -136,13 +136,13 @@ find_serial_devices() {
   local -a devs=()
   local d
 
-  # Common patterns
+  # Prefer "real" USB and modern serial devices.
+  # Only include a limited number of legacy ttyS* (many systems create dozens of them).
   for pattern in \
     '/dev/ttyUSB[0-9]*' \
     '/dev/ttyACM[0-9]*' \
     '/dev/ttyAMA[0-9]*' \
-    '/dev/ttyXRUSB[0-9]*' \
-    '/dev/ttyS[0-9]*'
+    '/dev/ttyXRUSB[0-9]*'
   do
     # shellcheck disable=SC2086
     for d in $pattern; do
@@ -150,8 +150,19 @@ find_serial_devices() {
     done
   done
 
-  # Dedup and sort nicely (USB/ACM first, then others)
-  printf '%s\n' "${devs[@]}" | sort -V | uniq
+  # Legacy ttyS* are usually unwanted noise. Use SHOW_LEGACY=1 to include a few.
+  if [[ "${SHOW_LEGACY:-0}" == "1" ]]; then
+    local s
+    for s in /dev/ttyS{0..3}; do
+      [[ -c "$s" ]] && devs+=("$s")
+    done
+  fi
+
+  # Dedup + sort
+  # shellcheck disable=SC2207
+  devs=($(printf '%s\n' "${devs[@]}" | sort -V | uniq))
+
+  printf '%s\n' "${devs[@]}"
 }
 
 # Try to return a nice one-line description for a device
@@ -198,7 +209,9 @@ describe_device() {
   if [[ -n "$vendor" || -n "$model" ]]; then
     pretty="${vendor:-} ${model:-}"
     pretty=${pretty//_/ }   # turn underscores into spaces
-    pretty=$(sed 's/  */ /g' <<<"$pretty" | xargs) # collapse spaces
+    # Protect the pipeline from set -e + pipefail
+    pretty=$(set +e; sed 's/  */ /g' <<<"$pretty" | xargs; set -e) || true
+    pretty=${pretty:-}
   fi
 
   if [[ -n "$serial" ]]; then
@@ -231,14 +244,18 @@ refresh_port_list() {
   DISPLAY_LINES=()
   REAL_DEVICES=()
 
+  local -a ports
+  # mapfile is the cleanest way (bash 4+)
+  mapfile -t ports < <(find_serial_devices || true)
+
   local dev desc num=0
-  while IFS= read -r dev; do
+  for dev in "${ports[@]}"; do
     [[ -z "$dev" ]] && continue
-    desc=$(describe_device "$dev")
+    desc=$(describe_device "$dev" || true)
     ((num++))
     DISPLAY_LINES+=("[$num] $dev   $desc")
     REAL_DEVICES+=("$dev")
-  done < <(find_serial_devices)
+  done
 }
 
 print_port_list() {
