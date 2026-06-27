@@ -27,7 +27,7 @@ This tool makes it a guided, friendly experience.
 Clone and run directly:
 
 ```bash
-git clone https://github.com/ken-rich_hpeprod/linux-serial-helper.git
+git clone https://github.com/krich11/linux-serial-helper.git
 cd linux-serial-helper
 chmod +x serial-helper
 ./serial-helper
